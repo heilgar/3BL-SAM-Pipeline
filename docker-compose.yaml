@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  localstack:
+    image: localstack/localstack:latest
+    environment:
+      - SERVICES=events,secretsmanager,s3,scheduler,vpc,rds,cloudformation,ec2,ssm,iam
+      - AWS_DEFAULT_REGION=eu-central-1
+      - AWS_ACCESS_KEY_ID=dev
+      - AWS_SECRET_ACCESS_KEY=dev
+      - EDGE_PORT=4566
+      - DEBUG=1
+      - LC_LOG=debug
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    ports:
+      - '4566-4597:4566-4597'
+      - '6645:6645'
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
+  database:
+    image: postgres:13.7
+    restart: always
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_PASSWORD: 'password'
+      POSTGRES_USER: 'user'
+      PGDATA: '/var/lib/postgresql/data/pgdata'
+    volumes:
+      - /var/lib/postgresql/data/pgdata
+    command: [ "postgres", "-c", "log_statement=all", "-c", "log_destination=stderr" ]

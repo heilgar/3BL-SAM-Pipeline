@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: ETL Lambda function with daily EventBridge trigger, VPC, RDS, and Secrets Manager
+
+Parameters:
+  URLBoxApiKey:
+    Type: String
+    Description: URLBox API Key
+  URLBoxApiSecret:
+    Type: String
+    Description: URLBox API Secret
+  DBUsername:
+    Type: String
+    Description: "The master username for the RDS database."
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9_]*$"
+    ConstraintDescription: "Must be between 1 and 63 characters long, and can contain only alphanumeric characters or underscores."
+    Default: 'etldbuser'
+  DBName:
+    Type: String
+    Description: Database name
+    Default: 'etldb'
+
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: ETL-VPC
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ETL-Private-Subnet-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ETL-Private-Subnet-2
+
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref VPC
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  SecretsManagerVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: ETL-Private-RT
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ETL-Lambda-SG
+      GroupDescription: Security group for Lambda function
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ETL-RDS-SG
+      GroupDescription: Security group for RDS instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS instance
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name:  !Sub "${AWS::StackName}-ETLDatabaseSecret"
+      Description: RDS database credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DBUsername}"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Ref DBName
+      Engine: postgres
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref DatabaseSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref DatabaseSecret, ':SecretString:password}}' ]]
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+
+  ETLFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./etl_function
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !Ref DatabaseSecret
+          S3_BUCKET: !Ref S3Bucket
+          URL_BOX_SECRET_NAME: !Ref URLBoxSecret
+          DB_NAME: !Ref DBName
+          DB_HOST: !GetAtt RDSInstance.Endpoint.Address
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+        - AmazonS3FullAccess
+        - SecretsManagerReadWrite
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 1 * * ? *)
+            Name: DailyETLJob
+            Description: Triggers ETL Lambda function daily at 1:00 AM UTC
+            Enabled: true
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Join:
+          - '-'
+          - - !Ref AWS::StackName
+            - !Select
+              - 0
+              - !Split
+                - '-'
+                - !Select
+                  - 2
+                  - !Split
+                    - '/'
+                    - !Ref AWS::StackId
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  URLBoxSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-URLBoxCredentials"
+      Description: URLBox API credentials
+      SecretString:
+        !Sub '{"api_key": "${URLBoxApiKey}", "api_secret": "${URLBoxApiSecret}"}'
+
+#
+#  SQLExecutionFunction:
+#    Type: AWS::Serverless::Function
+#    Properties:
+#      CodeUri: ./sql_execution_function
+#      Handler: index.lambda_handler
+#      Runtime: python3.12
+#      Timeout: 300
+#      MemorySize: 256
+#      Environment:
+#        Variables:
+#          DB_SECRET_ARN: !Ref DatabaseSecret
+#          DB_NAME: !Ref DBName
+#          DB_HOST: !GetAtt RDSInstance.Endpoint.Address
+#      Policies:
+#        - AWSLambdaVPCAccessExecutionRole
+#        - AmazonS3FullAccess
+#        - SecretsManagerReadWrite
+#      VpcConfig:
+#        SecurityGroupIds:
+#          - !Ref LambdaSecurityGroup
+#        SubnetIds:
+#          - !Ref PrivateSubnet1
+#          - !Ref PrivateSubnet2
+#
+#  ExecuteSQLPermission:
+#    Type: AWS::Lambda::Permission
+#    Properties:
+#      Action: lambda:InvokeFunction
+#      FunctionName: !GetAtt SQLExecutionFunction.Arn
+#      Principal: events.amazonaws.com
+#
+#  SQLExecutionCustomResource:
+#    Type: Custom::SQLExecution
+#    Properties:
+#      ServiceToken: !GetAtt SQLExecutionFunction.Arn
+#      DBSecretArn: !Ref DatabaseSecret
+#      DBName: !Ref DBName
+#      DBHost: !GetAtt RDSInstance.Endpoint.Address
+
+Outputs:
+  ETLFunction:
+    Description: "ETL Lambda Function ARN"
+    Value: !GetAtt ETLFunction.Arn
+  VPC:
+    Description: "VPC ID"
+    Value: !Ref VPC
+  S3Bucket:
+    Description: "S3 Bucket"
+    Value: !GetAtt S3Bucket.Arn
